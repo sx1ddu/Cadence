@@ -1,0 +1,5 @@
+{
+  "watch": ["src"],
+  "ignore": ["src/db/migrations/*"],
+  "ext": "js,json"
+}
