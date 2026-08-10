@@ -1,6 +1,25 @@
 const ApiError = require("../../utils/ApiError");
 const scheduleRepo = require("./schedule.repository");
 
+/**
+ * Cache staleness note: unlike event type updates (which invalidate the
+ * slots cache immediately — see eventType.service.js), changes made here
+ * do NOT proactively invalidate the Redis slots cache for event types
+ * that use this schedule. A schedule can be a user's implicit default
+ * (used by every event type that doesn't set its own scheduleId), so
+ * finding every affected event type would mean scanning across the
+ * user's whole event type list on every schedule edit — for a cache
+ * whose entries already expire after 30 seconds (see
+ * availability.service.js's SLOTS_CACHE_TTL_SECONDS), that cost isn't
+ * worth paying. The practical effect is that a schedule change can take
+ * up to 30 seconds to be reflected in publicly-displayed slots. This is
+ * a deliberate tradeoff, not an oversight — schedule edits are
+ * infrequent, and the FOR UPDATE transactional check at booking time
+ * (not the cache) is what actually prevents a real conflict, so a stale
+ * cache entry can cause a rejected booking attempt, never a double-booked
+ * one.
+ */
+
 /** Loads a schedule and throws 404/403 unless it belongs to `userId`. */
 async function getOwnedScheduleOr404(publicId, userId) {
   const schedule = await scheduleRepo.findByPublicId(publicId);

@@ -5,10 +5,38 @@ const { redis } = require("../../config/redis");
 const scheduleRepo = require("../schedules/schedule.repository");
 const bookingRepo = require("../bookings/booking.repository");
 const eventTypeRepo = require("../event-types/eventType.repository");
-const { buildDateRanges, subtractRanges, intersectAll, unionAll } = require("./dateRanges");
+const { buildDateRanges, subtractRanges, intersectAll, unionAll, shrinkRanges } = require("./dateRanges");
 const { buildSlots } = require("./slots");
 
 const SLOTS_CACHE_TTL_SECONDS = 30;
+
+/**
+ * The ONE place free ranges get turned into actual bookable start times.
+ * Every caller that needs "is this event type bookable at time X" —
+ * getAvailableSlots, booking creation's re-check, round-robin host
+ * selection — goes through this function, so the buffer/duration/notice
+ * rules can never drift out of sync between what's displayed and what's
+ * actually enforced at booking time.
+ *
+ * `freeRanges` is shrunk inward by the event type's own
+ * buffer_before_minutes/buffer_after_minutes BEFORE slots are cut from
+ * it — this is what makes buffers actually affect availability instead
+ * of being stored-but-ignored: a meeting that wants 15 minutes of
+ * breathing room after it needs that 15 minutes to itself be free too,
+ * not just its own start/end time.
+ */
+function computeValidSlots(freeRanges, eventType) {
+  const usableRanges = shrinkRanges(
+    freeRanges,
+    eventType.buffer_before_minutes,
+    eventType.buffer_after_minutes
+  );
+  return buildSlots(usableRanges, {
+    durationMinutes: eventType.duration_minutes,
+    intervalMinutes: eventType.slot_interval_minutes,
+    minimumNoticeMinutes: eventType.minimum_notice_minutes,
+  });
+}
 
 /**
  * Computes bookable slots for one event type over [fromDate, toDate).
@@ -20,10 +48,12 @@ const SLOTS_CACHE_TTL_SECONDS = 30;
  *      schedule for a team event type (team events have no single shared
  *      schedule to fall back to).
  *   2. Expand into free UTC date ranges per host.
- *   3. Subtract busy time (existing pending/confirmed bookings for that host).
+ *   3. Subtract busy time (existing pending/confirmed bookings for that
+ *      host, each padded by ITS OWN event type's buffers).
  *   4. Combine across hosts: COLLECTIVE intersects (every host must be
  *      free); ROUND_ROBIN unions (any one host free is enough).
- *   5. Chop the remaining free ranges into discrete slot start times.
+ *   5. Shrink by THIS event type's own buffers, then chop into discrete
+ *      slot start times (see computeValidSlots above).
  *
  * Short-TTL Redis caching: slot computation is read-heavy (every visit to
  * a booking page hits this) and cheap to get slightly stale for a few
@@ -38,13 +68,23 @@ async function getAvailableSlots({ eventType, fromDate, toDate, timezone }) {
   const cached = await redis.get(cacheKey);
   if (cached) return JSON.parse(cached);
 
-  const { freeRanges, hostTimezone } = await getFreeRangesForEventType(eventType, fromDate, toDate);
+  // Widen the window we actually compute over by a day on each side, then
+  // trim back to exactly what was requested at the end. This matters
+  // because `fromDate`/`toDate` are UTC calendar-day boundaries (set by
+  // the controller), but a schedule's own timezone can be offset from
+  // UTC — converting fromDate INTO the schedule's timezone before finding
+  // "start of day" can land on a different calendar day than the UTC
+  // date the caller asked for (most notably for timezones behind UTC,
+  // e.g. the Americas). Computing generously and trimming precisely
+  // avoids ever silently dropping a legitimate edge-of-window slot,
+  // without needing buildDateRanges itself to know about this asymmetry.
+  const widenedFrom = dayjs.utc(fromDate).subtract(1, "day").toDate();
+  const widenedTo = dayjs.utc(toDate).add(1, "day").toDate();
 
-  const slotStarts = buildSlots(freeRanges, {
-    durationMinutes: eventType.duration_minutes,
-    intervalMinutes: eventType.slot_interval_minutes,
-    minimumNoticeMinutes: eventType.minimum_notice_minutes,
-  });
+  const { freeRanges, hostTimezone } = await getFreeRangesForEventType(eventType, widenedFrom, widenedTo);
+  const slotStarts = computeValidSlots(freeRanges, eventType).filter(
+    (slot) => slot >= fromDate && slot < toDate
+  );
 
   const bookerTimezone = timezone || hostTimezone;
   const slots = groupSlotsByDay(slotStarts, bookerTimezone);
@@ -160,6 +200,7 @@ module.exports = {
   getAvailableSlots,
   getFreeRangesForEventType,
   getFreeRangesForHost,
+  computeValidSlots,
   invalidateSlotsCache,
   resolveSchedule,
   resolveScheduleForHost,

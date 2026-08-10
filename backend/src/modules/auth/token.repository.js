@@ -10,13 +10,38 @@ async function createRefreshToken({ userId, tokenHash, userAgent, ipAddress, exp
   );
 }
 
-async function findActiveRefreshToken(tokenHash) {
-  const [rows] = await pool.query(
-    `SELECT * FROM refresh_tokens
-     WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > NOW()
-     LIMIT 1`,
+/**
+ * Atomically revokes an active refresh token and returns the row that was
+ * revoked, or null if it wasn't found/already revoked/expired.
+ *
+ * This replaces the old find-then-revoke pattern (a SELECT to check the
+ * token is active, followed by a separate UPDATE to revoke it), which had
+ * a real race: two simultaneous refresh requests using the SAME token
+ * (e.g. a stolen refresh token used concurrently with the legitimate
+ * one, or a double-submitted request) could both pass the SELECT check
+ * before either UPDATE ran, and both would get issued a brand new token
+ * pair from what should be a single-use token.
+ *
+ * The fix is a single atomic UPDATE ... WHERE revoked_at IS NULL: MySQL
+ * guarantees only one concurrent UPDATE can match a given row's
+ * `revoked_at IS NULL` condition and flip it — the second one, running
+ * after the first commits, sees revoked_at already set and matches zero
+ * rows. `affectedRows` tells us which request "won" the race; the loser
+ * gets null back and should treat this exactly like an invalid token
+ * (which, functionally, is what a reused refresh token is).
+ */
+async function claimRefreshToken(tokenHash) {
+  const [result] = await pool.query(
+    `UPDATE refresh_tokens
+     SET revoked_at = NOW()
+     WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > NOW()`,
     [tokenHash]
   );
+  if (result.affectedRows === 0) return null;
+
+  const [rows] = await pool.query("SELECT * FROM refresh_tokens WHERE token_hash = ? LIMIT 1", [
+    tokenHash,
+  ]);
   return rows[0] || null;
 }
 
@@ -41,18 +66,30 @@ async function createEmailVerificationToken({ userId, tokenHash, expiresAt }) {
   );
 }
 
-async function findActiveEmailVerificationToken(tokenHash) {
+/**
+ * Same atomic claim pattern as claimRefreshToken: a single
+ * UPDATE ... WHERE used_at IS NULL closes the race where two
+ * simultaneous "verify email" requests with the same token (e.g. an
+ * email client that pre-fetches links, or a double-clicked button) could
+ * otherwise both read "not yet used" before either write landed.
+ * Functionally low-stakes here (verifying twice is harmless), but making
+ * it atomic costs nothing and means `affectedRows` gives a precise
+ * signal instead of a best-effort guess.
+ */
+async function claimEmailVerificationToken(tokenHash) {
+  const [result] = await pool.query(
+    `UPDATE email_verification_tokens
+     SET used_at = NOW()
+     WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW()`,
+    [tokenHash]
+  );
+  if (result.affectedRows === 0) return null;
+
   const [rows] = await pool.query(
-    `SELECT * FROM email_verification_tokens
-     WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW()
-     LIMIT 1`,
+    "SELECT * FROM email_verification_tokens WHERE token_hash = ? LIMIT 1",
     [tokenHash]
   );
   return rows[0] || null;
-}
-
-async function markEmailVerificationTokenUsed(id) {
-  await pool.query("UPDATE email_verification_tokens SET used_at = NOW() WHERE id = ?", [id]);
 }
 
 // ─── Password reset tokens ──────────────────────────────────────
@@ -65,29 +102,36 @@ async function createPasswordResetToken({ userId, tokenHash, expiresAt }) {
   );
 }
 
-async function findActivePasswordResetToken(tokenHash) {
+/**
+ * Same atomic claim pattern again. This one matters more than email
+ * verification: without it, two concurrent "reset password" submissions
+ * with the same token could both pass the check, both change the
+ * password (to two different values), and the second write silently
+ * wins — confusing for the user and a real (if narrow) integrity issue.
+ */
+async function claimPasswordResetToken(tokenHash) {
+  const [result] = await pool.query(
+    `UPDATE password_reset_tokens
+     SET used_at = NOW()
+     WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW()`,
+    [tokenHash]
+  );
+  if (result.affectedRows === 0) return null;
+
   const [rows] = await pool.query(
-    `SELECT * FROM password_reset_tokens
-     WHERE token_hash = ? AND used_at IS NULL AND expires_at > NOW()
-     LIMIT 1`,
+    "SELECT * FROM password_reset_tokens WHERE token_hash = ? LIMIT 1",
     [tokenHash]
   );
   return rows[0] || null;
 }
 
-async function markPasswordResetTokenUsed(id) {
-  await pool.query("UPDATE password_reset_tokens SET used_at = NOW() WHERE id = ?", [id]);
-}
-
 module.exports = {
   createRefreshToken,
-  findActiveRefreshToken,
+  claimRefreshToken,
   revokeRefreshToken,
   revokeAllRefreshTokensForUser,
   createEmailVerificationToken,
-  findActiveEmailVerificationToken,
-  markEmailVerificationTokenUsed,
+  claimEmailVerificationToken,
   createPasswordResetToken,
-  findActivePasswordResetToken,
-  markPasswordResetTokenUsed,
+  claimPasswordResetToken,
 };

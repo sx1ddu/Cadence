@@ -81,11 +81,10 @@ async function resendVerificationEmail(email) {
 
 async function verifyEmail(rawToken) {
   const tokenHash = hashToken(rawToken);
-  const record = await tokenRepo.findActiveEmailVerificationToken(tokenHash);
+  const record = await tokenRepo.claimEmailVerificationToken(tokenHash);
   if (!record) throw ApiError.badRequest("This verification link is invalid or has expired.");
 
   await userRepo.markEmailVerified(record.user_id);
-  await tokenRepo.markEmailVerificationTokenUsed(record.id);
 }
 
 async function login({ email, password }, context) {
@@ -104,10 +103,11 @@ async function login({ email, password }, context) {
 
 /**
  * Refresh token rotation: the incoming refresh token is verified and
- * checked against the DB (so a revoked/logged-out token can't be reused
- * even if it hasn't expired yet), then immediately revoked and replaced
- * with a brand new pair. This limits the damage if a refresh token is
- * ever stolen — it's single-use.
+ * atomically claimed (checked-and-revoked in one step — see
+ * token.repository.claimRefreshToken for why this needs to be atomic),
+ * then replaced with a brand new pair. This limits the damage if a
+ * refresh token is ever stolen — it's single-use, and reuse (by an
+ * attacker or by a race) is rejected outright.
  */
 async function refreshTokens(rawRefreshToken, context) {
   if (!rawRefreshToken) throw ApiError.unauthorized("Missing refresh token.");
@@ -120,13 +120,12 @@ async function refreshTokens(rawRefreshToken, context) {
   }
 
   const tokenHash = hashToken(rawRefreshToken);
-  const record = await tokenRepo.findActiveRefreshToken(tokenHash);
+  const record = await tokenRepo.claimRefreshToken(tokenHash);
   if (!record) throw ApiError.unauthorized("This session has been revoked. Please log in again.");
 
   const user = await userRepo.findByPublicId(payload.sub);
   if (!user || !user.is_active) throw ApiError.unauthorized("Account not found or inactive.");
 
-  await tokenRepo.revokeRefreshToken(tokenHash);
   const tokens = await issueTokenPair(user, context);
 
   return { user: userRepo.toPublicUser(user), tokens };
@@ -161,12 +160,11 @@ async function forgotPassword(email) {
 
 async function resetPassword(rawToken, newPassword) {
   const tokenHash = hashToken(rawToken);
-  const record = await tokenRepo.findActivePasswordResetToken(tokenHash);
+  const record = await tokenRepo.claimPasswordResetToken(tokenHash);
   if (!record) throw ApiError.badRequest("This reset link is invalid or has expired.");
 
   const passwordHash = await hashPassword(newPassword);
   await userRepo.updatePasswordHash(record.user_id, passwordHash);
-  await tokenRepo.markPasswordResetTokenUsed(record.id);
 
   // Invalidate every existing session — if an attacker had a stolen
   // refresh token, a password reset should kick them out too.

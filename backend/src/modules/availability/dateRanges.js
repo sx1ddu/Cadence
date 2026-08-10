@@ -28,7 +28,16 @@ function buildDateRanges(schedule, fromDate, toDate) {
 
   const ranges = [];
   let cursor = dayjs(fromDate).tz(tz).startOf("day");
-  const end = dayjs(toDate).tz(tz).endOf("day");
+  // `toDate` is an EXCLUSIVE upper bound throughout this codebase — every
+  // caller constructs it as "midnight of the day AFTER the last day
+  // wanted" (e.g. availability.controller.js does
+  // `toDate.setUTCDate(toDate.getUTCDate() + 1)`). Using `.endOf("day")`
+  // on toDate here would process one extra, unrequested day beyond that
+  // boundary — exactly the kind of off-by-one that's easy to miss by
+  // reading the code and only caught by actually running a test against
+  // it. Comparing directly against toDate (no endOf) respects the
+  // exclusive contract precisely.
+  const end = dayjs(toDate).tz(tz);
 
   while (cursor.isBefore(end)) {
     const dateKey = cursor.format("YYYY-MM-DD");
@@ -160,6 +169,30 @@ function unionAll(rangeLists) {
   return mergeOverlapping(all);
 }
 
+/**
+ * Pulls each free range's edges inward by `beforeMinutes`/`afterMinutes`.
+ *
+ * This is how a booking's OWN buffer preference gets enforced: if event
+ * type X wants a 15-minute buffer before every meeting, then a candidate
+ * meeting start time needs 15 free minutes immediately before it too, not
+ * just an empty calendar at the meeting's own start/end. Shrinking the
+ * free range first means the existing buildSlots() duration-fitting logic
+ * automatically respects this without needing to know about buffers at all.
+ */
+function shrinkRanges(ranges, beforeMinutes, afterMinutes) {
+  const beforeMs = (beforeMinutes || 0) * 60 * 1000;
+  const afterMs = (afterMinutes || 0) * 60 * 1000;
+  if (beforeMs === 0 && afterMs === 0) return ranges.map((r) => ({ ...r }));
+
+  const shrunk = [];
+  for (const range of ranges) {
+    const start = new Date(range.start.getTime() + beforeMs);
+    const end = new Date(range.end.getTime() - afterMs);
+    if (start < end) shrunk.push({ start, end });
+  }
+  return shrunk;
+}
+
 module.exports = {
   buildDateRanges,
   subtractRanges,
@@ -167,4 +200,5 @@ module.exports = {
   intersectRanges,
   intersectAll,
   unionAll,
+  shrinkRanges,
 };

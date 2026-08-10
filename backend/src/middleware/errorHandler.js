@@ -31,6 +31,14 @@ function errorHandler(err, req, res, next) { // eslint-disable-line no-unused-va
     });
   }
 
+  // CHECK constraint violations (e.g. an inconsistent combination of columns)
+  if (err.code === "ER_CHECK_CONSTRAINT_VIOLATED") {
+    return res.status(400).json({
+      success: false,
+      message: "That combination of fields isn't valid.",
+    });
+  }
+
   console.error("[unhandled error]", err);
 
   return res.status(500).json({

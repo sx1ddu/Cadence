@@ -8,8 +8,7 @@ const userRepo = require("../users/user.repository");
 const teamRepo = require("../teams/team.repository");
 const bookingRepo = require("./booking.repository");
 const availabilityService = require("../availability/availability.service");
-const { buildDateRanges, subtractRanges, intersectAll, unionAll } = require("../availability/dateRanges");
-const { buildSlots } = require("../availability/slots");
+const { buildDateRanges, subtractRanges, intersectAll } = require("../availability/dateRanges");
 
 /**
  * Creates a booking against a public event type — personal, round-robin,
@@ -48,6 +47,21 @@ async function createBooking(input) {
   const paymentStatus = eventType.price_amount ? "pending" : "not_required";
 
   const booking = await withTransaction(async (conn) => {
+    const limitWindow = await getBookingLimitWindow(eventType, startTime);
+    if (limitWindow) {
+      const count = await bookingRepo.countActiveBookingsForEventTypeInWindowForUpdate(
+        conn,
+        eventType.id,
+        limitWindow.windowStart,
+        limitWindow.windowEnd
+      );
+      if (count >= eventType.booking_limit_count) {
+        throw ApiError.badRequest(
+          `This event type only allows ${eventType.booking_limit_count} booking(s) per ${eventType.booking_limit_window}, and that limit has just been reached.`
+        );
+      }
+    }
+
     if (isSeatsBooking) {
       const currentSeats = await bookingRepo.countActiveBookingsAtExactSlotForUpdate(
         conn,
@@ -64,6 +78,7 @@ async function createBooking(input) {
         hostSelection.hostUserId,
         startTime,
         endTime,
+        eventType,
         { eventTypeId: eventType.id, startTime }
       );
       if (overlapExists) {
@@ -74,7 +89,8 @@ async function createBooking(input) {
         conn,
         hostSelection.allHostUserIds,
         startTime,
-        endTime
+        endTime,
+        eventType
       );
       if (overlapExists) {
         throw ApiError.conflict("This time slot was just booked by someone else. Please pick another.");
@@ -84,7 +100,8 @@ async function createBooking(input) {
         conn,
         hostSelection.hostUserId,
         startTime,
-        endTime
+        endTime,
+        eventType
       );
       if (overlapExists) {
         throw ApiError.conflict("This time slot was just booked by someone else. Please pick another.");
@@ -174,6 +191,27 @@ async function resolveHostsForBooking(eventType, startTime, endTime, isSeatsBook
   return { hostUserId: chosenHost.internal_id, allHostUserIds: [chosenHost.internal_id] };
 }
 
+/**
+ * Returns a UTC window guaranteed to fully contain "the calendar day
+ * `startTime` falls on" in ANY timezone, without needing to know which
+ * timezone that actually is up front (a round-robin/collective event
+ * type's hosts can each be in different timezones, and even a personal
+ * event type's relevant timezone isn't known until its schedule is
+ * loaded). Widening by a full day on each side (UTC offsets never
+ * exceed ±14 hours) is simpler and safer than trying to compute an
+ * exact local-day boundary here — using `dayjs(startTime).startOf('day')`
+ * without an explicit timezone would silently use the SERVER's system
+ * timezone instead, which could clip the edges of the real business day
+ * and reject valid slots near midnight in the host's actual timezone.
+ * The extra fetched range costs a little more work, not correctness.
+ */
+function getSafeDayWindow(startTime) {
+  return {
+    dayStart: dayjs.utc(startTime).subtract(1, "day").startOf("day").toDate(),
+    dayEnd: dayjs.utc(startTime).add(1, "day").endOf("day").toDate(),
+  };
+}
+
 function validateLocation(eventType, locationType) {
   const locations = parseJsonColumn(eventType.locations);
   const allowed = locations.some((l) => l.type === locationType);
@@ -216,9 +254,35 @@ async function assertWithinBookingWindow(eventType, startTime) {
  * computed in the event type's own schedule timezone (personal event
  * types) or the first host's timezone (team event types), so "per day"
  * means the relevant calendar day, not UTC's.
+ *
+ * This is a fast PRE-check only — it runs before the transaction opens,
+ * using a plain (non-locking) COUNT, purely so an obviously-over-the-limit
+ * request fails quickly without doing the work of resolving hosts. The
+ * AUTHORITATIVE check that actually prevents a race from exceeding the
+ * limit is the FOR UPDATE recount inside the transaction — see
+ * getBookingLimitWindow + countActiveBookingsForEventTypeInWindowForUpdate
+ * in createBooking.
  */
 async function assertWithinBookingLimit(eventType, startTime) {
-  if (!eventType.booking_limit_count || !eventType.booking_limit_window) return;
+  const window = await getBookingLimitWindow(eventType, startTime);
+  if (!window) return;
+
+  const count = await bookingRepo.countActiveBookingsForEventTypeInWindow(
+    eventType.id,
+    window.windowStart,
+    window.windowEnd
+  );
+
+  if (count >= eventType.booking_limit_count) {
+    throw ApiError.badRequest(
+      `This event type only allows ${eventType.booking_limit_count} booking(s) per ${eventType.booking_limit_window}, and that limit has been reached.`
+    );
+  }
+}
+
+/** Returns { windowStart, windowEnd } for this event type's booking limit, or null if none is configured. */
+async function getBookingLimitWindow(eventType, startTime) {
+  if (!eventType.booking_limit_count || !eventType.booking_limit_window) return null;
 
   const referenceUserId = eventType.team_id
     ? (await eventTypeRepo.getHosts(eventType.id))[0]?.internal_id
@@ -230,20 +294,7 @@ async function assertWithinBookingLimit(eventType, startTime) {
   const local = dayjs(startTime).tz(schedule.timezone);
 
   const unit = { day: "day", week: "week", month: "month" }[eventType.booking_limit_window];
-  const windowStart = local.startOf(unit).toDate();
-  const windowEnd = local.endOf(unit).toDate();
-
-  const count = await bookingRepo.countActiveBookingsForEventTypeInWindow(
-    eventType.id,
-    windowStart,
-    windowEnd
-  );
-
-  if (count >= eventType.booking_limit_count) {
-    throw ApiError.badRequest(
-      `This event type only allows ${eventType.booking_limit_count} booking(s) per ${eventType.booking_limit_window}, and that limit has been reached.`
-    );
-  }
+  return { windowStart: local.startOf(unit).toDate(), windowEnd: local.endOf(unit).toDate() };
 }
 
 /** Personal event type: re-derives the free slots for just the requested day and confirms startTime is one of them. */
@@ -264,19 +315,14 @@ async function assertSeatsSlotIsValid(eventType, startTime) {
 
 /** Collective team event: every assigned host must have this exact slot free. */
 async function assertCollectiveSlotIsFree(eventType, hosts, startTime, endTime) {
-  const dayStart = dayjs(startTime).startOf("day").toDate();
-  const dayEnd = dayjs(startTime).endOf("day").toDate();
+  const { dayStart, dayEnd } = getSafeDayWindow(startTime);
 
   const perHost = await Promise.all(
     hosts.map((h) => availabilityService.getFreeRangesForHost(h.internal_id, null, dayStart, dayEnd))
   );
   const combined = intersectAll(perHost.map((r) => r.freeRanges));
 
-  const validSlots = buildSlots(combined, {
-    durationMinutes: eventType.duration_minutes,
-    intervalMinutes: eventType.slot_interval_minutes,
-    minimumNoticeMinutes: eventType.minimum_notice_minutes,
-  });
+  const validSlots = availabilityService.computeValidSlots(combined, eventType);
 
   const isValid = validSlots.some((slot) => slot.getTime() === startTime.getTime());
   if (!isValid) {
@@ -286,8 +332,7 @@ async function assertCollectiveSlotIsFree(eventType, hosts, startTime, endTime) 
 
 /** Shared logic for personal + seats event types (single host, union of one). */
 async function isSlotWithinFreeRanges(eventType, startTime, { excludeEventTypeId } = {}) {
-  const dayStart = dayjs(startTime).startOf("day").toDate();
-  const dayEnd = dayjs(startTime).endOf("day").toDate();
+  const { dayStart, dayEnd } = getSafeDayWindow(startTime);
 
   const schedule = await availabilityService.resolveSchedule(eventType);
   const dateRanges = buildDateRanges(schedule, dayStart, dayEnd);
@@ -299,11 +344,7 @@ async function isSlotWithinFreeRanges(eventType, startTime, { excludeEventTypeId
   );
   const freeRanges = subtractRanges(dateRanges, busyRanges);
 
-  const validSlots = buildSlots(freeRanges, {
-    durationMinutes: eventType.duration_minutes,
-    intervalMinutes: eventType.slot_interval_minutes,
-    minimumNoticeMinutes: eventType.minimum_notice_minutes,
-  });
+  const validSlots = availabilityService.computeValidSlots(freeRanges, eventType);
 
   return validSlots.some((slot) => slot.getTime() === startTime.getTime());
 }
@@ -318,8 +359,7 @@ async function isSlotWithinFreeRanges(eventType, startTime, { excludeEventTypeId
  * project's scope.
  */
 async function pickRoundRobinHost(eventType, hosts, startTime, endTime) {
-  const dayStart = dayjs(startTime).startOf("day").toDate();
-  const dayEnd = dayjs(startTime).endOf("day").toDate();
+  const { dayStart, dayEnd } = getSafeDayWindow(startTime);
 
   const freeHostIds = [];
   for (const host of hosts) {
@@ -329,11 +369,7 @@ async function pickRoundRobinHost(eventType, hosts, startTime, endTime) {
       dayStart,
       dayEnd
     );
-    const validSlots = buildSlots(freeRanges, {
-      durationMinutes: eventType.duration_minutes,
-      intervalMinutes: eventType.slot_interval_minutes,
-      minimumNoticeMinutes: eventType.minimum_notice_minutes,
-    });
+    const validSlots = availabilityService.computeValidSlots(freeRanges, eventType);
     if (validSlots.some((slot) => slot.getTime() === startTime.getTime())) {
       freeHostIds.push(host.internal_id);
     }
@@ -502,7 +538,14 @@ async function rejectBooking(publicId, hostUserId, { reason }) {
 async function getOwnedBookingOr404(publicId, hostUserId) {
   const booking = await bookingRepo.findByPublicId(publicId);
   if (!booking) throw ApiError.notFound("Booking not found.");
-  if (booking.host_user_id !== hostUserId) throw ApiError.forbidden("This isn't your booking.");
+
+  // For a personal or round-robin booking there's exactly one host, so
+  // this is equivalent to the old `host_user_id === hostUserId` check —
+  // but for a COLLECTIVE booking with several hosts, checking only the
+  // "primary" host_user_id would incorrectly forbid the other assigned
+  // hosts from managing a booking they're actually part of.
+  const isHost = await bookingRepo.isUserHostOnBooking(booking.id, hostUserId);
+  if (!isHost) throw ApiError.forbidden("This isn't your booking.");
   return booking;
 }
 

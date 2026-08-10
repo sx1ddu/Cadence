@@ -4,6 +4,7 @@ const scheduleRepo = require("../schedules/schedule.repository");
 const userRepo = require("../users/user.repository");
 const bookingRepo = require("../bookings/booking.repository");
 const teamRepo = require("../teams/team.repository");
+const availabilityService = require("../availability/availability.service");
 
 /**
  * Loads an event type and verifies the requesting user is allowed to
@@ -152,6 +153,33 @@ async function updateEventType(publicId, userId, input) {
   // scope here; delete and recreate instead).
   const { teamId, ...rest } = input;
 
+  if (!eventType.team_id && rest.schedulingType) {
+    throw ApiError.badRequest("schedulingType only applies to team event types.");
+  }
+
+  // A partial PATCH must still result in a VALID overall event type — the
+  // same cross-field rules createEventTypeSchema enforces at creation
+  // (bookingLimitWindow required alongside bookingLimitCount, currency
+  // required alongside priceAmount, seatsPerSlot incompatible with
+  // requiresConfirmation/team event types) have to hold for the
+  // EFFECTIVE state after the patch is applied, not just the fields being
+  // changed in isolation. Without this, e.g. `PATCH { bookingLimitCount: 5 }`
+  // alone would silently store a limit with no window, which
+  // assertWithinBookingLimit then treats as "no limit configured" —
+  // exactly the stored-but-not-enforced bug pattern to avoid.
+  assertUpdateInvariants({
+    bookingLimitCount: rest.bookingLimitCount !== undefined ? rest.bookingLimitCount : eventType.booking_limit_count,
+    bookingLimitWindow: rest.bookingLimitWindow !== undefined ? rest.bookingLimitWindow : eventType.booking_limit_window,
+    priceAmount: rest.priceAmount !== undefined ? rest.priceAmount : eventType.price_amount,
+    currency: rest.currency !== undefined ? rest.currency : eventType.currency,
+    seatsPerSlot: rest.seatsPerSlot !== undefined ? rest.seatsPerSlot : eventType.seats_per_slot,
+    requiresConfirmation:
+      rest.requiresConfirmation !== undefined
+        ? rest.requiresConfirmation
+        : Boolean(eventType.requires_confirmation),
+    isTeamEventType: Boolean(eventType.team_id),
+  });
+
   const scheduleInternalId = eventType.team_id
     ? undefined // team event types don't use scheduleId at all
     : await resolveScheduleInternalId(input.scheduleId, userId);
@@ -164,7 +192,34 @@ async function updateEventType(publicId, userId, input) {
   }
 
   const hosts = row.team_id ? await eventTypeRepo.getHosts(row.id) : [];
+  await availabilityService.invalidateSlotsCache(row.public_id);
   return eventTypeRepo.toOwnerView(row, hosts);
+}
+
+/** Shared cross-field invariants — must hold both at creation (enforced by Zod) and after any update. */
+function assertUpdateInvariants({
+  bookingLimitCount,
+  bookingLimitWindow,
+  priceAmount,
+  currency,
+  seatsPerSlot,
+  requiresConfirmation,
+  isTeamEventType,
+}) {
+  if (bookingLimitCount && !bookingLimitWindow) {
+    throw ApiError.badRequest("bookingLimitWindow is required when bookingLimitCount is set.");
+  }
+  if (priceAmount && !currency) {
+    throw ApiError.badRequest("currency is required when priceAmount is set.");
+  }
+  if (seatsPerSlot && requiresConfirmation) {
+    throw ApiError.badRequest("Group events (seatsPerSlot) can't require confirmation.");
+  }
+  if (seatsPerSlot && isTeamEventType) {
+    throw ApiError.badRequest(
+      "Group events (seatsPerSlot) aren't supported on team event types."
+    );
+  }
 }
 
 async function deleteEventType(publicId, userId) {
@@ -179,12 +234,19 @@ async function deleteEventType(publicId, userId) {
 }
 
 // ─── Public booking-page endpoints ──────────────────────────────
+//
+// IMPORTANT: these two functions serve UNAUTHENTICATED requests, so they
+// must use userRepo.toPublicProfile (name/username/bio/avatar/timezone
+// only) — never userRepo.toPublicUser, which includes email and role and
+// is meant only for rendering a user's view of THEMSELVES (see
+// auth.service.js / user.service.js). Using toPublicUser here would leak
+// the host's email address to any anonymous visitor of their booking page.
 
 async function listPublicEventTypes(username) {
   const user = await userRepo.findByUsername(username);
   if (!user) throw ApiError.notFound("User not found.");
   const rows = await eventTypeRepo.listActiveForUsername(username);
-  return { user: userRepo.toPublicUser(user), eventTypes: rows.map(eventTypeRepo.toPublicView) };
+  return { user: userRepo.toPublicProfile(user), eventTypes: rows.map(eventTypeRepo.toPublicView) };
 }
 
 async function getPublicEventType(username, slug) {
@@ -192,7 +254,7 @@ async function getPublicEventType(username, slug) {
   if (!user) throw ApiError.notFound("User not found.");
   const row = await eventTypeRepo.findActiveBySlugForUsername(username, slug);
   if (!row) throw ApiError.notFound("Event type not found.");
-  return { user: userRepo.toPublicUser(user), eventType: eventTypeRepo.toPublicView(row) };
+  return { user: userRepo.toPublicProfile(user), eventType: eventTypeRepo.toPublicView(row) };
 }
 
 async function listPublicTeamEventTypes(teamSlug) {
