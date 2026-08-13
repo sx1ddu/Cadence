@@ -75,4 +75,14 @@ module.exports = {
     apiKey: process.env.CLOUDINARY_API_KEY,
     apiSecret: process.env.CLOUDINARY_API_SECRET,
   },
+
+  // Used to encrypt Google OAuth tokens at rest — see utils/crypto.js.
+  // Generate with: openssl rand -hex 32
+  encryptionKey: process.env.ENCRYPTION_KEY,
+
+  google: {
+    clientId: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+    redirectUri: process.env.GOOGLE_REDIRECT_URI || "http://localhost:4000/api/calendars/google/callback",
+  },
 };

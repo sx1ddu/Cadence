@@ -339,6 +339,45 @@ async function updateStatus(id, status, extra = {}) {
 }
 
 /**
+ * Updates ONLY payment_status, leaving booking status untouched — used by
+ * the payments module, since a booking's lifecycle status (pending/
+ * confirmed/cancelled/rejected) and its payment status are orthogonal:
+ * a booking can require host confirmation AND payment independently, and
+ * paying doesn't automatically confirm it (see payment.service.js).
+ */
+async function updatePaymentStatus(id, paymentStatus) {
+  await pool.query("UPDATE bookings SET payment_status = ? WHERE id = ?", [paymentStatus, id]);
+  return findById(id);
+}
+
+async function setGoogleCalendarEventId(id, googleEventId) {
+  await pool.query("UPDATE bookings SET google_calendar_event_id = ? WHERE id = ?", [googleEventId, id]);
+}
+
+/**
+ * Backup sweep query for the reminder cron job (see jobs/cron/reminderSweep.js):
+ * confirmed bookings starting soon that haven't had a reminder sent yet.
+ * This exists ALONGSIDE the primary mechanism (a BullMQ delayed job
+ * scheduled at booking-confirmation time — see booking.service.js's
+ * scheduleReminderForBooking) as a safety net for bookings that might
+ * have missed that path (e.g. the worker was down at confirmation time).
+ */
+async function findBookingsNeedingReminderSweep(windowMinutes) {
+  const [rows] = await pool.query(
+    `SELECT * FROM bookings
+     WHERE status = 'confirmed'
+       AND reminder_sent_at IS NULL
+       AND start_time BETWEEN NOW() AND DATE_ADD(NOW(), INTERVAL ? MINUTE)`,
+    [windowMinutes]
+  );
+  return rows;
+}
+
+async function markReminderSent(id) {
+  await pool.query("UPDATE bookings SET reminder_sent_at = NOW() WHERE id = ?", [id]);
+}
+
+/**
  * For round-robin fairness: the most recent active booking timestamp for
  * each of the given candidate hosts. A host with no prior bookings (not
  * in the result map) is treated as "longest ago" — i.e. prioritized —
@@ -394,6 +433,10 @@ module.exports = {
   createWithConnection,
   listForHost,
   updateStatus,
+  updatePaymentStatus,
+  setGoogleCalendarEventId,
+  findBookingsNeedingReminderSweep,
+  markReminderSent,
   hasBookingsForEventType,
   isUserHostOnBooking,
   getLastBookingTimePerHost,

@@ -5,7 +5,15 @@ const { redis } = require("../../config/redis");
 const scheduleRepo = require("../schedules/schedule.repository");
 const bookingRepo = require("../bookings/booking.repository");
 const eventTypeRepo = require("../event-types/eventType.repository");
-const { buildDateRanges, subtractRanges, intersectAll, unionAll, shrinkRanges } = require("./dateRanges");
+const calendarService = require("../calendars/calendar.service");
+const {
+  buildDateRanges,
+  subtractRanges,
+  intersectAll,
+  unionAll,
+  shrinkRanges,
+  mergeOverlapping,
+} = require("./dateRanges");
 const { buildSlots } = require("./slots");
 
 const SLOTS_CACHE_TTL_SECONDS = 30;
@@ -143,7 +151,19 @@ function buildCacheKey(eventTypePublicId, fromDate, toDate, timezone) {
 async function getFreeRangesForHost(hostUserId, scheduleInternalId, fromDate, toDate) {
   const schedule = await resolveScheduleForHost(hostUserId, scheduleInternalId);
   const dateRanges = buildDateRanges(schedule, fromDate, toDate);
-  const busyRanges = await bookingRepo.getBusyRangesForUser(hostUserId, fromDate, toDate);
+
+  // Busy time comes from two sources: Cadence's own bookings, and (if
+  // connected) the host's external Google Calendar — a meeting on their
+  // Google Calendar should block a Cadence booking from being placed on
+  // top of it, exactly like an internal booking would.
+  const [cadenceBusyRanges, googleBusyRanges] = await Promise.all([
+    bookingRepo.getBusyRangesForUser(hostUserId, fromDate, toDate),
+    calendarService.getBusyRanges(hostUserId, fromDate, toDate),
+  ]);
+  const busyRanges = mergeOverlapping(
+    [...cadenceBusyRanges, ...googleBusyRanges].sort((a, b) => a.start - b.start)
+  );
+
   return { freeRanges: subtractRanges(dateRanges, busyRanges), timezone: schedule.timezone };
 }
 

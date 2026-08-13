@@ -1,3 +1,4 @@
+const ApiError = require("../../utils/ApiError");
 const userService = require("./user.service");
 const asyncHandler = require("../../utils/asyncHandler");
 
@@ -11,4 +12,10 @@ const updateMe = asyncHandler(async (req, res) => {
   res.json({ success: true, data: { user } });
 });
 
-module.exports = { getPublicProfile, updateMe };
+const uploadAvatar = asyncHandler(async (req, res) => {
+  if (!req.file) throw ApiError.badRequest("No image file was uploaded (expected field name 'avatar').");
+  const user = await userService.uploadAvatar(req.dbUser.id, req.file.buffer);
+  res.json({ success: true, data: { user } });
+});
+
+module.exports = { getPublicProfile, updateMe, uploadAvatar };

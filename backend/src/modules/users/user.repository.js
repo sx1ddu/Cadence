@@ -95,6 +95,10 @@ async function updateProfile(userId, data) {
   return findById(userId);
 }
 
+async function updateAvatarPublicId(userId, avatarPublicId) {
+  await pool.query("UPDATE users SET avatar_public_id = ? WHERE id = ?", [avatarPublicId, userId]);
+}
+
 module.exports = {
   toPublicUser,
   toPublicProfile,
@@ -106,4 +110,5 @@ module.exports = {
   markEmailVerified,
   updatePasswordHash,
   updateProfile,
+  updateAvatarPublicId,
 };

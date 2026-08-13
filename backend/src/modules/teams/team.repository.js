@@ -88,13 +88,13 @@ async function findMembership(teamId, userId) {
 }
 
 /** Creates a team and adds the creator as an admin member, atomically. */
-async function createTeam({ name, slug, ownerId, isOrganization }) {
+async function createTeam({ name, slug, ownerId, isOrganization, parentId }) {
   return withTransaction(async (conn) => {
     const publicId = uuidv4();
     const [result] = await conn.query(
-      `INSERT INTO teams (public_id, name, slug, owner_id, is_organization)
-       VALUES (?, ?, ?, ?, ?)`,
-      [publicId, name, slug, ownerId, isOrganization ? 1 : 0]
+      `INSERT INTO teams (public_id, name, slug, owner_id, is_organization, parent_id)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [publicId, name, slug, ownerId, isOrganization ? 1 : 0, parentId || null]
     );
     const teamId = result.insertId;
 
@@ -105,6 +105,14 @@ async function createTeam({ name, slug, ownerId, isOrganization }) {
 
     return teamId;
   });
+}
+
+/** Sub-teams belonging to an organization (teams with parent_id = this org's internal id). */
+async function listByParent(parentId) {
+  const [rows] = await pool.query(`${SELECT_WITH_JOINS} WHERE t.parent_id = ? ORDER BY t.created_at ASC`, [
+    parentId,
+  ]);
+  return rows;
 }
 
 async function updateTeam(teamId, { name, slug }) {
@@ -161,6 +169,7 @@ module.exports = {
   findById,
   findBySlug,
   listForUser,
+  listByParent,
   getMembers,
   findMembership,
   createTeam,

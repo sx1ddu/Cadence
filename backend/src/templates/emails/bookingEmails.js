@@ -66,9 +66,26 @@ function bookingReminderTemplate({ recipientName, title, startTime, timezone }) 
   };
 }
 
+function paymentConfirmedTemplate({ recipientName, title, startTime, timezone, amount, currency }) {
+  const formattedAmount = (amount / 100).toFixed(2); // amount is stored in the smallest currency unit
+  return {
+    subject: `Payment received for ${title}`,
+    html: `
+      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto;">
+        <h2>Payment confirmed 💳</h2>
+        <p>Hi ${escapeHtml(recipientName)},</p>
+        <p>We've received payment of <strong>${formattedAmount} ${escapeHtml(currency)}</strong> for:</p>
+        <p><strong>${escapeHtml(title)}</strong></p>
+        <p style="font-size:16px;"><strong>${formatWhen(startTime, timezone)}</strong></p>
+      </div>
+    `,
+  };
+}
+
 module.exports = {
   bookingConfirmedTemplate,
   bookingPendingTemplate,
   bookingCancelledTemplate,
   bookingReminderTemplate,
+  paymentConfirmedTemplate,
 };

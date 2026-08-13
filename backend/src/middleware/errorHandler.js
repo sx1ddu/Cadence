@@ -39,6 +39,14 @@ function errorHandler(err, req, res, next) { // eslint-disable-line no-unused-va
     });
   }
 
+  // Multer errors (e.g. file too large, unexpected field name)
+  if (err.name === "MulterError") {
+    return res.status(400).json({
+      success: false,
+      message: err.code === "LIMIT_FILE_SIZE" ? "File is too large (max 5MB)." : err.message,
+    });
+  }
+
   console.error("[unhandled error]", err);
 
   return res.status(500).json({

@@ -6,6 +6,7 @@ const {
   bookingPendingTemplate,
   bookingCancelledTemplate,
   bookingReminderTemplate,
+  paymentConfirmedTemplate,
 } = require("../../templates/emails/bookingEmails");
 
 /**
@@ -41,6 +42,10 @@ async function processEmailJob(job) {
     }
     case "booking-reminder": {
       ({ subject, html } = bookingReminderTemplate(data));
+      break;
+    }
+    case "payment-confirmed": {
+      ({ subject, html } = paymentConfirmedTemplate(data));
       break;
     }
     default:

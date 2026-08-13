@@ -7,6 +7,8 @@ const eventTypeRepo = require("../event-types/eventType.repository");
 const userRepo = require("../users/user.repository");
 const teamRepo = require("../teams/team.repository");
 const bookingRepo = require("./booking.repository");
+const webhookService = require("../webhooks/webhook.service");
+const calendarService = require("../calendars/calendar.service");
 const availabilityService = require("../availability/availability.service");
 const { buildDateRanges, subtractRanges, intersectAll } = require("../availability/dateRanges");
 
@@ -131,7 +133,89 @@ async function createBooking(input) {
   await availabilityService.invalidateSlotsCache(eventType.public_id);
   await sendBookingCreatedEmails({ booking, hostUserIds: hostSelection.allHostUserIds, eventType, status });
 
-  return bookingRepo.toPublicBooking(booking);
+  const publicBooking = bookingRepo.toPublicBooking(booking);
+  await webhookService.fireEvent(booking.host_user_id, "booking.created", publicBooking);
+  if (status === "confirmed") {
+    await webhookService.fireEvent(booking.host_user_id, "booking.confirmed", publicBooking);
+    await syncBookingToGoogleCalendar(booking);
+    const primaryHost = await userRepo.findById(booking.host_user_id);
+    await scheduleReminderForBooking(booking, primaryHost);
+  }
+
+  return publicBooking;
+}
+
+/**
+ * Creates a Google Calendar event for the booking's primary host, if
+ * they've connected one — a no-op (returns immediately) if they haven't,
+ * since Google Calendar sync is opt-in. Scoped to the PRIMARY host only,
+ * even for a collective booking with several hosts: creating and
+ * tracking one event per host would mean storing multiple event ids per
+ * booking (google_calendar_event_id is a single column), which is real
+ * added complexity for a feature most personal/round-robin bookings
+ * never even exercise — a documented scope decision, not an oversight.
+ */
+async function syncBookingToGoogleCalendar(booking) {
+  const googleEventId = await calendarService.createEventForBooking(booking.host_user_id, booking);
+  if (googleEventId) {
+    await bookingRepo.setGoogleCalendarEventId(booking.id, googleEventId);
+  }
+}
+
+const REMINDER_LEAD_TIME_MINUTES = 60;
+
+/**
+ * Schedules a reminder email as a BullMQ DELAYED job, timed to arrive
+ * REMINDER_LEAD_TIME_MINUTES before the meeting starts. This is the
+ * primary reminder mechanism — jobs/cron/reminderSweep.js is a backup
+ * safety net, not the main path, since a delayed job scheduled right at
+ * confirmation time is simpler to reason about than "a cron job wakes up
+ * periodically and figures out what's due."
+ *
+ * `jobId` is deterministic (based on the booking's public id) so calling
+ * this twice for the same booking is a safe no-op — BullMQ won't queue a
+ * duplicate job under an id that already exists.
+ */
+async function scheduleReminderForBooking(booking, host) {
+  const reminderTime = dayjs(booking.start_time).subtract(REMINDER_LEAD_TIME_MINUTES, "minute");
+  const delayMs = reminderTime.diff(dayjs());
+  if (delayMs <= 0) return; // meeting is already too soon (or in the past) for a lead-time reminder
+
+  const jobId = `reminder-attendee-${booking.public_id}`;
+  await emailQueue.add(
+    "booking-reminder",
+    {
+      to: booking.attendee_email,
+      recipientName: booking.attendee_name,
+      title: booking.title,
+      startTime: booking.start_time,
+      timezone: booking.attendee_timezone,
+    },
+    { delay: delayMs, jobId }
+  );
+
+  if (host) {
+    await emailQueue.add(
+      "booking-reminder",
+      {
+        to: host.email,
+        recipientName: host.name,
+        title: booking.title,
+        startTime: booking.start_time,
+        timezone: host.timezone,
+      },
+      { delay: delayMs, jobId: `reminder-host-${booking.public_id}` }
+    );
+  }
+}
+
+/** Removes a scheduled reminder job — called when a booking is cancelled, so a reminder never fires for a dead meeting. */
+async function cancelReminderForBooking(bookingPublicId) {
+  const jobIds = [`reminder-attendee-${bookingPublicId}`, `reminder-host-${bookingPublicId}`];
+  for (const jobId of jobIds) {
+    const job = await emailQueue.getJob(jobId);
+    if (job) await job.remove();
+  }
 }
 
 /** Looks up the event type via either its personal booking page or its team booking page. */
@@ -466,6 +550,11 @@ async function cancelBookingInternal(booking, { reason, cancelledBy }) {
   const eventType = await eventTypeRepo.findById(booking.event_type_id);
   await availabilityService.invalidateSlotsCache(eventType.public_id);
 
+  if (booking.google_calendar_event_id) {
+    await calendarService.deleteEventForBooking(booking.host_user_id, booking.google_calendar_event_id);
+  }
+  await cancelReminderForBooking(booking.public_id);
+
   const host = await userRepo.findById(booking.host_user_id);
   const shared = { title: booking.title, startTime: booking.start_time, reason };
 
@@ -484,7 +573,9 @@ async function cancelBookingInternal(booking, { reason, cancelledBy }) {
     });
   }
 
-  return bookingRepo.toPublicBooking(updated);
+  const publicBooking = bookingRepo.toPublicBooking(updated);
+  await webhookService.fireEvent(booking.host_user_id, "booking.cancelled", publicBooking);
+  return publicBooking;
 }
 
 async function confirmBooking(publicId, hostUserId) {
@@ -496,6 +587,9 @@ async function confirmBooking(publicId, hostUserId) {
   const updated = await bookingRepo.updateStatus(booking.id, "confirmed");
   const host = await userRepo.findById(hostUserId);
 
+  await syncBookingToGoogleCalendar(updated);
+  await scheduleReminderForBooking(updated, host);
+
   await emailQueue.add("booking-confirmed", {
     to: booking.attendee_email,
     recipientName: booking.attendee_name,
@@ -506,7 +600,9 @@ async function confirmBooking(publicId, hostUserId) {
     attendeeName: booking.attendee_name,
   });
 
-  return bookingRepo.toPublicBooking(updated);
+  const publicBooking = bookingRepo.toPublicBooking(updated);
+  await webhookService.fireEvent(booking.host_user_id, "booking.confirmed", publicBooking);
+  return publicBooking;
 }
 
 async function rejectBooking(publicId, hostUserId, { reason }) {
@@ -532,7 +628,9 @@ async function rejectBooking(publicId, hostUserId, { reason }) {
     reason: reason || "The host was unable to confirm this booking.",
   });
 
-  return bookingRepo.toPublicBooking(updated);
+  const publicBooking = bookingRepo.toPublicBooking(updated);
+  await webhookService.fireEvent(booking.host_user_id, "booking.rejected", publicBooking);
+  return publicBooking;
 }
 
 async function getOwnedBookingOr404(publicId, hostUserId) {
