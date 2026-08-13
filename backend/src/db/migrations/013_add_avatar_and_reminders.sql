@@ -5,6 +5,6 @@ ALTER TABLE users
   ADD COLUMN avatar_public_id VARCHAR(255) NULL AFTER avatar_url;
 
 -- Tracks whether a reminder email has already gone out for a booking, so
--- the reminder sweep (see jobs/cron/sendReminders.js) never double-sends.
+-- the reminder sweep (see jobs/cron/reminderSweep.js) never double-sends.
 ALTER TABLE bookings
   ADD COLUMN reminder_sent_at DATETIME NULL AFTER updated_at;

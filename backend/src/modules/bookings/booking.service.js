@@ -176,46 +176,50 @@ const REMINDER_LEAD_TIME_MINUTES = 60;
  * this twice for the same booking is a safe no-op — BullMQ won't queue a
  * duplicate job under an id that already exists.
  */
+/**
+ * Schedules a reminder email as a SINGLE BullMQ delayed job per booking
+ * (carrying both the attendee's and host's recipient details), timed to
+ * fire REMINDER_LEAD_TIME_MINUTES before the meeting starts.
+ *
+ * This is deliberately ONE job, not two — the job processor
+ * (jobs/processors/email.processor.js) atomically claims
+ * booking.reminder_sent_at via bookingRepo.claimReminderSlot() before
+ * sending anything, and the node-cron backup sweep
+ * (jobs/cron/reminderSweep.js) claims through that exact same function.
+ * Whichever mechanism actually gets to run first wins the claim and
+ * sends both emails; the other finds the claim already taken and sends
+ * nothing. Two separate jobs (one per recipient) would each need their
+ * own claim, which wouldn't actually solve the BullMQ-vs-cron race this
+ * exists to prevent — a single job/single claim is what makes "exactly
+ * one reminder wave per booking" actually guaranteed rather than merely
+ * likely.
+ */
 async function scheduleReminderForBooking(booking, host) {
   const reminderTime = dayjs(booking.start_time).subtract(REMINDER_LEAD_TIME_MINUTES, "minute");
   const delayMs = reminderTime.diff(dayjs());
   if (delayMs <= 0) return; // meeting is already too soon (or in the past) for a lead-time reminder
 
-  const jobId = `reminder-attendee-${booking.public_id}`;
   await emailQueue.add(
     "booking-reminder",
     {
-      to: booking.attendee_email,
-      recipientName: booking.attendee_name,
+      bookingId: booking.id,
       title: booking.title,
       startTime: booking.start_time,
-      timezone: booking.attendee_timezone,
-    },
-    { delay: delayMs, jobId }
-  );
-
-  if (host) {
-    await emailQueue.add(
-      "booking-reminder",
-      {
-        to: host.email,
-        recipientName: host.name,
-        title: booking.title,
-        startTime: booking.start_time,
-        timezone: host.timezone,
+      attendee: {
+        to: booking.attendee_email,
+        recipientName: booking.attendee_name,
+        timezone: booking.attendee_timezone,
       },
-      { delay: delayMs, jobId: `reminder-host-${booking.public_id}` }
-    );
-  }
+      host: host ? { to: host.email, recipientName: host.name, timezone: host.timezone } : null,
+    },
+    { delay: delayMs, jobId: `reminder-${booking.public_id}` }
+  );
 }
 
 /** Removes a scheduled reminder job — called when a booking is cancelled, so a reminder never fires for a dead meeting. */
 async function cancelReminderForBooking(bookingPublicId) {
-  const jobIds = [`reminder-attendee-${bookingPublicId}`, `reminder-host-${bookingPublicId}`];
-  for (const jobId of jobIds) {
-    const job = await emailQueue.getJob(jobId);
-    if (job) await job.remove();
-  }
+  const job = await emailQueue.getJob(`reminder-${bookingPublicId}`);
+  if (job) await job.remove();
 }
 
 /** Looks up the event type via either its personal booking page or its team booking page. */

@@ -43,12 +43,26 @@ async function findLatestForBooking(bookingId) {
   return rows[0] || null;
 }
 
-async function markPaid(id, { razorpayPaymentId, razorpaySignature }) {
-  await pool.query(
+/**
+ * Atomically transitions a payment to 'paid' and returns whether THIS
+ * call was the one that did it. Razorpay's own documented best practice
+ * is to run BOTH the client-side verify call AND the server-to-server
+ * webhook — meaning they can genuinely race each other in production,
+ * not just in theory. The old version of this function (a plain UPDATE
+ * with no WHERE-status guard, called only after a separate SELECT
+ * checked `status === 'paid'`) had exactly the check-then-act race
+ * already fixed elsewhere in this codebase for auth tokens and
+ * reminders: both the verify call and the webhook could pass the SELECT
+ * before either write landed, and both would mark paid, send a
+ * confirmation email, and update the booking — twice.
+ */
+async function claimAsPaid(id, { razorpayPaymentId, razorpaySignature }) {
+  const [result] = await pool.query(
     `UPDATE payments SET status = 'paid', razorpay_payment_id = ?, razorpay_signature = ?
-     WHERE id = ?`,
+     WHERE id = ? AND status != 'paid'`,
     [razorpayPaymentId, razorpaySignature || null, id]
   );
+  return result.affectedRows === 1;
 }
 
 async function markFailed(id) {
@@ -65,7 +79,7 @@ module.exports = {
   findById,
   findByRazorpayOrderId,
   findLatestForBooking,
-  markPaid,
+  claimAsPaid,
   markFailed,
   markRefunded,
 };

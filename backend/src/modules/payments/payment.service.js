@@ -79,16 +79,19 @@ async function verifyPayment({ razorpay_order_id, razorpay_payment_id, razorpay_
   const payment = await paymentRepo.findByRazorpayOrderId(razorpay_order_id);
   if (!payment) throw ApiError.notFound("No matching payment order found.");
 
-  if (payment.status === "paid") {
-    // Already processed (e.g. the webhook beat the client here) — treat
-    // as success rather than erroring, since the end state is correct.
-    return { verified: true, alreadyProcessed: true };
-  }
-
-  await paymentRepo.markPaid(payment.id, {
+  const claimed = await paymentRepo.claimAsPaid(payment.id, {
     razorpayPaymentId: razorpay_payment_id,
     razorpaySignature: razorpay_signature,
   });
+  if (!claimed) {
+    // Already paid — most likely the webhook won the race and got there
+    // first. The end state is correct either way, so this is a success,
+    // not an error, but we must NOT re-send the confirmation email or
+    // re-update the booking (that already happened when the claim
+    // actually succeeded, on whichever side won it).
+    return { verified: true, alreadyProcessed: true };
+  }
+
   await bookingRepo.updatePaymentStatus(payment.booking_id, "paid");
   await sendPaymentConfirmedEmail(payment.booking_id);
 
@@ -126,9 +129,14 @@ async function handleWebhook(rawBody, signatureHeader) {
     if (!orderId) return;
 
     const payment = await paymentRepo.findByRazorpayOrderId(orderId);
-    if (!payment || payment.status === "paid") return; // unknown order, or already processed
+    if (!payment) return; // unknown order
 
-    await paymentRepo.markPaid(payment.id, { razorpayPaymentId: paymentId, razorpaySignature: null });
+    const claimed = await paymentRepo.claimAsPaid(payment.id, {
+      razorpayPaymentId: paymentId,
+      razorpaySignature: null,
+    });
+    if (!claimed) return; // already paid — the client's verify call won the race, or this webhook was redelivered
+
     await bookingRepo.updatePaymentStatus(payment.booking_id, "paid");
     await sendPaymentConfirmedEmail(payment.booking_id);
   } else if (eventType === "payment.failed") {

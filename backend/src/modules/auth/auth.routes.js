@@ -14,7 +14,12 @@ const {
 
 const router = express.Router();
 
-router.post("/signup", validate(signupSchema), controller.signup);
+router.post(
+  "/signup",
+  rateLimit({ keyPrefix: "signup", windowSec: 300, max: 5 }),
+  validate(signupSchema),
+  controller.signup
+);
 
 router.post("/verify-email", validate(verifyEmailSchema), controller.verifyEmail);
 

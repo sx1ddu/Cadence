@@ -373,8 +373,24 @@ async function findBookingsNeedingReminderSweep(windowMinutes) {
   return rows;
 }
 
-async function markReminderSent(id) {
-  await pool.query("UPDATE bookings SET reminder_sent_at = NOW() WHERE id = ?", [id]);
+/**
+ * Atomically claims the right to send this booking's reminder, and
+ * returns whether the claim succeeded. Both the BullMQ delayed-job
+ * processor and the node-cron backup sweep call this same function
+ * before sending anything — whichever one gets there first wins the
+ * claim (affectedRows === 1) and proceeds; the other sees
+ * reminder_sent_at already set (affectedRows === 0) and skips sending
+ * entirely. This is the same UPDATE...WHERE...IS NULL pattern used for
+ * refresh-token/password-reset token claims, applied here to prevent
+ * the two independent reminder mechanisms from ever both sending for
+ * the same booking.
+ */
+async function claimReminderSlot(id) {
+  const [result] = await pool.query(
+    "UPDATE bookings SET reminder_sent_at = NOW() WHERE id = ? AND reminder_sent_at IS NULL",
+    [id]
+  );
+  return result.affectedRows === 1;
 }
 
 /**
@@ -436,7 +452,7 @@ module.exports = {
   updatePaymentStatus,
   setGoogleCalendarEventId,
   findBookingsNeedingReminderSweep,
-  markReminderSent,
+  claimReminderSlot,
   hasBookingsForEventType,
   isUserHostOnBooking,
   getLastBookingTimePerHost,
