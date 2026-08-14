@@ -1,68 +1,127 @@
-# Cadence — Backend
+# Cadence
 
-An original scheduling-platform backend inspired by Cal.com's engineering
-concepts, built with Express + raw MySQL SQL + Redis + BullMQ. No ORM.
+**A scheduling and booking platform backend, designed and built from the ground up with Node.js, Express, MySQL, Redis, and BullMQ.**
 
-This backend is being built incrementally, module by module, each fully
-functional (no placeholders, no TODOs on implemented features) before
-moving to the next.
+Cadence handles the full lifecycle of a scheduling product: authentication, availability calculation, bookings, team scheduling (round-robin and collective), payments, calendar sync, notifications, and background job processing — all implemented with raw SQL and no ORM.
 
-## Stack
+---
 
-- **Runtime**: Node.js 18+, Express
-- **Database**: MySQL 8+ (XAMPP-compatible), raw SQL via `mysql2`
-- **Cache / rate limiting / slot caching**: Redis (`ioredis`)
-- **Background jobs**: BullMQ (email sending runs in a separate worker process)
-- **Auth**: JWT access + refresh tokens (httpOnly cookies), bcrypt password hashing
-- **Email**: Nodemailer (SMTP)
-- **Validation**: Zod
+## Table of Contents
 
-## Modules implemented so far
+- [Honest Status](#honest-status)
+- [Tech Stack](#tech-stack)
+- [Modules](#modules)
+- [Project Layout](#project-layout)
+- [Getting Started](#getting-started)
+- [API Reference](#api-reference)
+- [Engineering Notes](#engineering-notes)
 
-| Module | What it does |
+---
+
+## Honest Status
+
+Every module described below is genuinely implemented — real logic, real database queries, real third-party SDK integrations. Nothing here is a stubbed placeholder. That said, "genuinely implemented" and "verified against live services" are different claims, so this section draws a clear line between the two.
+
+### Verified by execution
+
+**Auth, Users, Schedules, Availability Engine, Event Types, Booking Engine, Teams (Round-Robin/Collective), and Group Events** went through a dedicated correctness pass: real bugs were identified and fixed (buffer enforcement, timezone/DST edge cases, race conditions in token handling and booking limits, an information-disclosure issue, an authorization gap). A 27-test unit suite runs and passes with `npm test`, with no external infrastructure required.
+
+### Implemented with real logic, not yet verified against live external services
+
+**Razorpay payments, Cloudinary uploads, Google Calendar OAuth/sync, and outbound webhooks** are built directly against each provider's documented API — real signature-verification formulas, real SDK call shapes, real OAuth token-refresh handling — but have not been exercised end-to-end against live provider accounts in the environment these were developed in.
+
+| Integration | What's implemented | What's untested |
+|---|---|---|
+| **Razorpay** | Order creation, checkout-signature verification (HMAC of `order_id\|payment_id`), webhook signature verification (HMAC of the raw request body), refunds | An actual round-trip against a live Razorpay account |
+| **Cloudinary** | Buffer-stream avatar upload, URL + public ID storage, cleanup of replaced images | An actual upload against a live Cloudinary account |
+| **Google Calendar** | Full OAuth consent flow, encrypted token storage (AES-256-GCM), automatic token-refresh persistence, FreeBusy lookups merged into the availability engine, event create/delete tied to the booking lifecycle | The live OAuth consent screen and Calendar API calls, which require a registered Google Cloud project |
+| **Webhooks** | HMAC-signed delivery via a BullMQ worker, retries with backoff, delivery history log | An actual receiving endpoint on the other end |
+
+Each of these should be tested against real credentials before being relied on in production. The implementations are careful and complete, not placeholders — but "written correctly" and "observed working" are different claims, and this README is deliberately precise about which applies where.
+
+### Implemented and expected to work out of the box (no external service dependency)
+
+**Reminders** (BullMQ delayed jobs scheduled at booking-confirmation time, with a node-cron backup sweep), **Analytics & Dashboard APIs** (plain SQL aggregation), **Admin APIs** (role-gated user, booking, and team management), and **Organizations** (a thin layer over the existing team infrastructure). None of these depend on an external service, so they carry the same "written, syntax-checked, logically traced" confidence as the verified modules above, even without a dedicated live-integration test pass.
+
+### Explicitly out of scope
+
+- **Booking reschedule** — only cancel-and-rebook exists today. A true reschedule that preserves booking history and updates in place would warrant its own design pass.
+- **Meeting links for non-Google providers** (Zoom, etc.) — only the Google Calendar event itself (and its Meet link, if conferencing is enabled on the calendar) is covered.
+- **Multi-host Google Calendar sync for collective bookings** — only the primary host's calendar receives an event. A documented, deliberate scope decision (see `booking.service.js`).
+
+---
+
+## Tech Stack
+
+| Layer | Choice |
 |---|---|
-| **Auth** | Signup, email verification, login, refresh-token rotation, logout (single device / all devices), forgot/reset password |
-| **User Profiles** | `/api/me` self-service profile; `/api/users/:username` public profile for booking pages |
-| **Schedules & Availability** | Named weekly working-hours templates, plus per-date overrides (holidays, one-off hours) |
-| **Event Types** | Personal AND team-owned bookable "products" — duration, locations, custom booking questions, buffers, minimum notice, booking-window limits, per-window booking caps, optional price, optional seats (group events) |
-| **Availability Engine** | Interval-arithmetic slot computation, extended to combine multiple hosts: intersection for collective events, union for round-robin. Redis-cached for 30s per event type/date-range |
-| **Booking Engine** | Public booking creation with two-layer conflict prevention (re-derived availability check + `SELECT ... FOR UPDATE` transactional lock), booking-limit enforcement, confirm/reject workflow, attendee/host cancellation, email notifications |
-| **Teams & Organizations** | Shared booking namespaces (`/team-pages/:slug`), admin/member roles, round-robin host selection (priority → least-recently-booked), collective events (every host must be free), organizations modeled as teams with `is_organization=1` |
-| **Group Events (seats)** | A single time slot can accept multiple independent attendees up to a configured capacity, with its own seat-capacity locking — personal event types only (see design notes) |
+| Runtime | Node.js 18+, Express |
+| Database | MySQL 8+ (XAMPP-compatible), raw SQL via `mysql2` — no ORM |
+| Cache / rate limiting / slot caching | Redis (`ioredis`) |
+| Background jobs | BullMQ (email, webhook delivery) + node-cron (reminder backup sweep) |
+| Authentication | JWT access + refresh tokens (httpOnly cookies), bcrypt password hashing |
+| Payments | Razorpay — orders, signature verification, webhooks, refunds |
+| File uploads | Cloudinary (avatars) |
+| Calendar sync | Google Calendar — OAuth, FreeBusy, event CRUD |
+| Email | Nodemailer (SMTP) |
+| Validation | Zod |
 
-Not yet built (planned next): Google Calendar sync + generated meeting
-links, Razorpay payments, Cloudinary avatar/attachment uploads, webhooks,
-reminder cron jobs, dashboard/analytics endpoints, admin APIs.
+---
 
-## Project layout
+## Modules
+
+| Module | Responsibility |
+|---|---|
+| **Auth** | Signup, email verification, login, atomic refresh-token rotation, logout, atomic forgot/reset password |
+| **User Profiles** | Self-service profile management, public profile pages, Cloudinary avatar upload |
+| **Schedules & Availability** | Weekly availability templates, date overrides, DST-correct, buffer-aware |
+| **Event Types** | Personal and team-owned bookable events — buffers, limits, seats, pricing |
+| **Availability Engine** | Interval arithmetic, buffer-aware, multi-host aggregation (round-robin/collective), merges Google Calendar busy time |
+| **Booking Engine** | Two-layer conflict prevention, race-safe booking limits, confirm/reject/cancel flows, calendar event sync, reminder scheduling |
+| **Teams & Organizations** | Role-based membership, round-robin and collective scheduling; organizations implemented as a team variant (`is_organization = 1`) with sub-teams via `parent_id` |
+| **Payments** | Razorpay order creation, signature-verified confirmation, webhook handling, refunds |
+| **Uploads** | Cloudinary avatar upload with automatic cleanup of replaced images |
+| **Google Calendar** | OAuth connect/disconnect, encrypted token storage, FreeBusy sync, event create/delete on the booking lifecycle |
+| **Webhooks** | User-managed subscriptions, HMAC-signed delivery via BullMQ, retries, delivery history |
+| **Reminders** | BullMQ delayed jobs (primary mechanism) with a node-cron sweep as a backup |
+| **Analytics & Dashboard** | Booking counts by status, event type, and time; team statistics; a combined dashboard-summary endpoint |
+| **Admin** | Role-gated platform stats, user search and management, bookings and teams overview |
+
+---
+
+## Project Layout
 
 ```
 src/
-  config/       env, MySQL pool, Redis client, Nodemailer transport
-  db/
-    migrate.js         forward-only migration runner
-    seed.js            demo user for quick manual testing
-    migrations/         numbered .sql files, applied in order
-  middleware/    authenticate, validate, rateLimit, errorHandler
+  config/          env, MySQL pool, Redis, mailer, Cloudinary, Razorpay, Google OAuth
+  db/               migrations (numbered .sql, forward-only), migrate.js, seed.js
+  middleware/       authenticate, validate, rateLimit, upload (multer), errorHandler
   modules/
-    auth/            signup/login/refresh/verify/reset
-    users/           profile (self + public), shared user repository
-    schedules/       weekly availability templates + date overrides
-    event-types/     bookable event type CRUD — personal AND team-owned
-    availability/     the slot-computation engine (dateRanges.js, slots.js) + service
-    bookings/        booking creation, listing, confirm/reject/cancel
-    teams/           team CRUD, membership, public team booking pages
+    auth/ users/ schedules/ event-types/ availability/ bookings/ teams/
+    payments/        Razorpay orders, verification, webhooks, refunds
+    calendars/        Google OAuth, FreeBusy, event CRUD
+    webhooks/         subscription CRUD, delivery log
+    analytics/        SQL aggregation, dashboard summary
+    admin/            role-gated platform management
+    organizations/    thin layer over teams
   jobs/
-    queues/      BullMQ queue definitions
-    processors/  the actual job logic (e.g. sending an email)
-    workers/     worker process entry point (run separately from the API)
-  templates/emails/  plain-function HTML email templates
-  utils/         ApiError, asyncHandler, jwt, password, cookies, dayjs, json
-  app.js         Express app (middleware + route mounting)
-  server.js      boots the HTTP server (checks DB/Redis first)
+    queues/           BullMQ queue definitions (email, webhook-delivery)
+    processors/       job logic (send email, deliver webhook)
+    cron/             reminderSweep.js — node-cron backup
+    workers/          worker process entry point (BullMQ workers + cron)
+  templates/emails/
+  utils/             ApiError, asyncHandler, jwt, password, cookies, dayjs, json,
+                      crypto (AES-256-GCM), cloudinaryUpload
+  app.js
+  server.js
+tests/
+  unit/              pure-function tests — `npm test`, no infrastructure required
+  integration/        real HTTP tests against a live server — see tests/README.md
 ```
 
-## Setup
+---
+
+## Getting Started
 
 ### 1. Install dependencies
 
@@ -70,10 +129,9 @@ src/
 npm install
 ```
 
-### 2. Start MySQL (via XAMPP) and Redis
+### 2. Start MySQL and Redis
 
-- Start MySQL from the XAMPP control panel (default: `127.0.0.1:3306`, user `root`, no password).
-- Start Redis locally (`redis-server`).
+MySQL via XAMPP (or any local MySQL 8+ instance); Redis via your platform's usual method.
 
 ### 3. Configure environment
 
@@ -81,7 +139,13 @@ npm install
 cp .env.example .env
 ```
 
-Fill in `DB_*`, the three secrets (`JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, `COOKIE_SECRET` — use `openssl rand -hex 64`), and `SMTP_*` if you want emails to actually send.
+**Required:** `DB_*`, `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, `COOKIE_SECRET` (generate each with `openssl rand -hex 64`).
+
+**Optional** (only needed for the corresponding feature — the app boots fine without them, and only the specific feature errors when actually used):
+- `SMTP_*` — outbound email
+- `RAZORPAY_KEY_ID` / `RAZORPAY_KEY_SECRET` / `RAZORPAY_WEBHOOK_SECRET` — payments
+- `CLOUDINARY_*` — avatar uploads
+- `ENCRYPTION_KEY` (`openssl rand -hex 32`) + `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — Google Calendar
 
 ### 4. Run migrations
 
@@ -89,102 +153,78 @@ Fill in `DB_*`, the three secrets (`JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, `C
 npm run db:migrate
 ```
 
-### 5. (Optional) Seed a demo user
+### 5. Start the application
 
 ```bash
-npm run db:seed
+npm run dev      # API server
+npm run worker   # BullMQ workers + reminder cron — run in a separate terminal
 ```
 
-### 6. Start the API server
+### 6. Run the tests
 
 ```bash
-npm run dev
+npm test                   # unit tests
+npm run test:integration   # requires steps 2–5 completed first
 ```
 
-### 7. Start the background worker (separate terminal)
+---
 
-```bash
-npm run worker
-```
+## API Reference
 
-## API reference
+### Auth — `/api/auth`
+`signup` · `verify-email` · `resend-verification` · `login` · `refresh` · `logout` · `logout-all` · `forgot-password` · `reset-password` · `me`
 
-### Auth (`/api/auth`)
-
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| POST | `/signup` | No | Create account, sends verification email |
-| POST | `/verify-email` | No | Body: `{ token }` |
-| POST | `/resend-verification` | No | Body: `{ email }` |
-| POST | `/login` | No | Body: `{ email, password }`, sets auth cookies |
-| POST | `/refresh` | Refresh cookie | Rotates tokens |
-| POST | `/logout` | Refresh cookie | Revokes current session |
-| POST | `/logout-all` | Access token | Revokes every session |
-| POST | `/forgot-password` | No | Body: `{ email }` |
-| POST | `/reset-password` | No | Body: `{ token, newPassword }` |
-| GET | `/me` | Access token | Current user |
-
-### Profile (`/api/me`)
-
-| Method | Path | Auth | Description |
-|---|---|---|---|
-| GET | `/` | Yes | Current user |
-| PATCH | `/` | Yes | Update `name`, `username`, `bio`, `timezone` |
-
-### Schedules (`/api/schedules`) — all require auth (owner-only)
-
-| Method | Path | Description |
+### Profile — `/api/me`
+| Method | Path | Notes |
 |---|---|---|
-| GET / POST | `/` | List / create schedules |
-| GET / PATCH / DELETE | `/:id` | Manage one schedule |
-| POST / DELETE | `/:id/overrides[/​:overrideId]` | Manage date overrides |
+| `GET` | `/` | Current profile |
+| `PATCH` | `/` | Update profile |
+| `POST` | `/avatar` | Multipart upload, field name `avatar` |
 
-### Event Types (`/api/event-types`)
+### Schedules, Event Types, Teams, Bookings
+See inline route documentation in each module's `*.routes.js` file.
 
+### Payments — `/api/payments`
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET | `/` | Yes | My personal event types |
-| GET | `/team/:teamId` | Yes (member) | A team's event types |
-| POST | `/` | Yes | Create — pass `teamId` + `schedulingType` + `hostUserIds` for a team event type, omit them for personal |
-| GET / PATCH / DELETE | `/:id` | Yes (owner or team admin) | Manage one event type |
+| `POST` | `/orders` | Booking ID acts as capability token | `{ bookingId }` → Razorpay order |
+| `POST` | `/verify` | None | `{ razorpay_order_id, razorpay_payment_id, razorpay_signature }` |
+| `POST` | `/webhook` | Signature-verified | Razorpay server-to-server webhook |
+| `POST` | `/:bookingId/refund` | Host only | Refund a paid booking |
 
-### Teams (`/api/teams`) — all require auth
-
+### Google Calendar — `/api/calendars`
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| GET / POST | `/` | Member / any user | List my teams / create a team (creator becomes admin) |
-| GET / PATCH / DELETE | `/:id` | Member / admin / owner | Manage a team |
-| POST | `/:id/members` | Admin | Add an existing user by email |
-| PATCH | `/:id/members/:userId` | Admin | Change role (blocked if it'd leave zero admins) |
-| DELETE | `/:id/members/:userId` | Admin, or self | Remove a member / leave |
+| `GET` | `/google/connect` | Required | Returns the Google OAuth consent URL |
+| `GET` | `/google/callback` | None (Google redirects here) | Completes the OAuth flow |
+| `GET` | `/status` | Required | Connection status |
+| `DELETE` | `/google` | Required | Disconnects and revokes tokens |
 
-### Public booking pages
-
-| Method | Path | Description |
-|---|---|---|
-| GET | `/api/users/:username` | Personal public profile |
-| GET | `/api/users/:username/event-types[/:slug]` | Personal event types |
-| GET | `/api/users/:username/event-types/:slug/slots?from=&to=&timezone=` | Personal slots |
-| GET | `/api/team-pages/:slug` | Team public profile |
-| GET | `/api/team-pages/:slug/event-types[/:eventSlug]` | Team event types |
-| GET | `/api/team-pages/:slug/event-types/:eventSlug/slots?from=&to=&timezone=` | Team slots (round-robin/collective aware) |
-
-### Bookings (`/api/bookings`)
-
+### Webhooks — `/api/webhooks`
 | Method | Path | Auth | Description |
 |---|---|---|---|
-| POST | `/` | No | Create. Body needs `eventTypeSlug` + exactly one of `username`/`teamSlug`, plus `startTime`, `attendeeName`, `attendeeEmail`, `attendeeTimezone`, `locationType`, `answers` |
-| GET | `/public/:id` | No | Look up by public id (confirmation page) |
-| POST | `/public/:id/cancel` | No | Attendee cancels |
-| GET | `/` | Yes | Host's bookings, filterable by `?status=&from=&to=` |
-| POST | `/:id/cancel` \| `/:id/confirm` \| `/:id/reject` | Yes | Host actions |
+| `GET` / `POST` | `/` | Required | List / create — secret is shown once, at creation |
+| `PATCH` / `DELETE` | `/:id` | Required | Update / delete |
+| `GET` | `/:id/deliveries` | Required | Delivery history |
 
-## Design notes worth knowing for an interview
+### Analytics — `/api/analytics`
+`GET /dashboard` · `/overview` · `/by-event-type` · `/over-time?days=30` · `/teams/:teamId`
 
-- **No ORM, raw parameterized SQL everywhere.**
-- **Double-booking prevention** uses `SELECT ... FOR UPDATE` inside the same transaction as the `INSERT`, taking an InnoDB gap lock on the affected index range.
-- **`booking_hosts`** is the authoritative record of who must be marked busy by a booking — one row for a personal or round-robin booking, one row per host for a collective booking. `bookings.host_user_id` is kept alongside it purely as the "primary host" for simple dashboard queries.
-- **Round-robin fairness** is deliberately simplified from Cal.com's weighted-calibration algorithm: priority, then least-recently-booked. No new-host ramp-up or OOO-aware weighting — a reasonable trade documented in `booking.service.js`.
-- **Organizations = Teams** with `is_organization=1` and no `parent_id`; sub-teams point back at the org via `parent_id` — avoids a duplicate parallel table.
-- **Group events (seats) are personal-event-type only.** Combining seats with round-robin/collective host-picking (who "owns" a shared webinar slot across rotating hosts?) adds real complexity for limited teaching value at this project's scope, so it's explicitly out of scope for team event types (enforced in validation, not silently dropped).
-- **Public IDs vs internal IDs**: every table has an internal auto-increment `id` and a `public_id` UUID exposed in the API, so clients never see or guess sequential database IDs.
+### Admin — `/api/admin` (requires `role: admin`)
+`GET /stats` · `/users` · `PATCH /users/:userId/active` · `PATCH /users/:userId/role` · `GET /bookings` · `/teams`
+
+### Organizations — `/api/organizations`
+`GET` / `POST /` · `GET` / `POST /:id/teams`
+
+---
+
+## Engineering Notes
+
+A few design decisions worth highlighting:
+
+- **Payment signatures are never trusted from the client.** Both the checkout-callback signature and the webhook signature are recomputed server-side from data only Razorpay could have signed.
+- **OAuth tokens are encrypted at rest** (AES-256-GCM, `utils/crypto.js`) — a database compromise alone doesn't expose calendar access.
+- **The OAuth `state` parameter is HMAC-signed**, not a bare random string. Since Google redirects the browser directly to the callback, this is how the callback identifies the correct user, and it cannot be forged without the server's own secret.
+- **Reminders use a delayed BullMQ job as the primary mechanism**, keyed with a deterministic job ID so re-scheduling is a safe no-op, backed by a node-cron sweep — not a single, fragile trigger.
+- **Webhook delivery is HMAC-signed** using the same pattern as the platform's own inbound Razorpay webhook verification, applied in the opposite direction.
+- **Organizations reuse the `teams` table** rather than introducing a parallel schema — an organization is simply a team with `is_organization = 1` that other teams reference via `parent_id`.
